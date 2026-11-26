@@ -1,6 +1,6 @@
 ---
 title: "Previsão de vendas diárias de bens de consumo (FMCG)"
-subtitle: "Análise exploratória, regressão e suavização exponencial"
+subtitle: "Análise exploratória, regressão, suavização exponencial e ARIMA"
 author: "Gabriela Lopes, Gabriel Vilhena, Maíra Amaral e Maria Elisa Moreira"
 lang: pt
 format:
@@ -58,13 +58,15 @@ fmt_k <- list(big.mark = ".", decimal.mark = ",")
 
 # Introdução
 
-Este trabalho analisa e modela a série temporal de unidades vendidas por dia, obtida pela soma das vendas de todos os produtos de uma base de bens de consumo de alto giro (FMCG). O relatório descreve a base, apresenta a análise exploratória dos dados e da série, ajusta modelos de previsão por grupo (referência, regressão e suavização exponencial) e avalia o desempenho preditivo em um conjunto de teste.
+Este trabalho analisa e modela a série temporal de unidades vendidas por dia, obtida pela soma das vendas de todos os produtos de uma base de bens de consumo de alto giro (FMCG). O relatório descreve a base, apresenta a análise exploratória dos dados e da série, ajusta modelos de previsão por grupo (referência, regressão, suavização exponencial e ARIMA) e avalia o desempenho preditivo em um conjunto de teste.
 
 A análise é feita sobre o total de unidades vendidas. As categorias de produtos aparecem apenas na descrição da base, e nenhuma categoria específica é modelada separadamente.
 
 # Descrição dos dados
 
 A base `FMCG_2022_2024.csv` é um conjunto de dados que simula vendas diárias de produtos de bens de consumo de alto giro (*fast-moving consumer goods*) entre 2022 e 2024. Cada linha representa um SKU em um dia, em um canal de venda e uma região. A base foi desenhada para estudar sazonalidade, ciclo de vida de produtos, efeitos de promoção, rupturas de estoque e previsão de demanda.
+
+A base foi obtida no Kaggle (*FMCG Daily Sales Data 2022–2024*, de Beata Faron, disponível em <https://www.kaggle.com/datasets/beatafaron/fmcg-daily-sales-data-to-2022-2024>). Segundo a própria autora, trata-se de uma base **sintética**, que simula vendas de um fabricante de bens de consumo na Polônia, inspirada em cenários reais do setor. O uso de uma base sintética foi autorizado pelo professor da disciplina.
 
 | Variável | Descrição |
 |---|---|
@@ -645,6 +647,102 @@ Seleção. O Holt tem o menor AICc (`r fmt(tab_ets["Holt", "AICc"], 1)`), seguid
 
 Limitações e melhorias. A série tem variância maior no fim do período, e uma transformação (logaritmo ou Box-Cox) poderia ajudar. A sazonalidade anual não pode ser representada com período 7, e modelos com termos harmônicos ou período maior exigiriam mais anos de dados. O limite de $\phi$ em `r fmt(tab_par["Holt amortecido", "phi"], 2)` também restringe o amortecimento.
 
+## ARIMA
+
+A análise exploratória mostrou que uma diferença simples torna a série estacionária (d = 1) e que, na série diferenciada, a ACF tem um único pico significativo no lag 1, enquanto a PACF decai lentamente. Esse é o padrão de um MA(1) na série diferenciada, o que aponta o ARIMA(0,1,1) para analisar inicialmente. A partir dele, os candidatos são construídos acrescentando um termo de cada vez:
+
+1. A1: ARIMA(0,1,1), sugerido pela ACF e PACF;
+2. A2: ARIMA(0,1,2), com um termo de média móvel a mais;
+3. A3: ARIMA(1,1,1), com um termo autorregressivo a mais;
+4. A4: ARIMA(2,1,1);
+5. A5: SARIMA(0,1,1)(1,0,0)~7~, para verificar se um termo sazonal semanal melhora o modelo;
+6. `auto.arima`, usado apenas como conferência da escolha manual.
+
+Os modelos são estimados por máxima verossimilhança com `Arima()`. No teste de Ljung-Box dos resíduos, os graus de liberdade são descontados do número de parâmetros estimados.
+
+```{r}
+#| label: arima
+mods_arima <- list(
+  "A1: ARIMA(0,1,1)"            = Arima(treino, order = c(0, 1, 1)),
+  "A2: ARIMA(0,1,2)"            = Arima(treino, order = c(0, 1, 2)),
+  "A3: ARIMA(1,1,1)"            = Arima(treino, order = c(1, 1, 1)),
+  "A4: ARIMA(2,1,1)"            = Arima(treino, order = c(2, 1, 1)),
+  "A5: SARIMA(0,1,1)(1,0,0)[7]" = Arima(treino, order = c(0, 1, 1),
+                                        seasonal = c(1, 0, 0)))
+auto_arima <- auto.arima(treino, stepwise = FALSE, approximation = FALSE)
+mods_arima[[paste("auto.arima:", as.character(auto_arima))]] <- auto_arima
+
+prev_arima <- lapply(mods_arima, forecast, h = n_teste)
+```
+
+```{r}
+#| label: tbl-coef-arima
+#| tbl-cap: "ARIMA: coeficientes estimados e teste z (H0: coeficiente igual a zero)."
+tab_coef_arima <- do.call(rbind, lapply(names(mods_arima), function(nm) {
+  m   <- mods_arima[[nm]]
+  est <- coef(m)
+  if (length(est) == 0) return(NULL)
+  ep  <- sqrt(diag(m$var.coef))
+  z   <- est / ep
+  data.frame(modelo = nm, parâmetro = names(est), estimativa = est,
+             `erro-padrão` = ep, z = z, `p-valor` = 2 * pnorm(-abs(z)),
+             check.names = FALSE, row.names = NULL)
+}))
+tab_coef_arima$`p-valor` <- format.pval(tab_coef_arima$`p-valor`, digits = 2,
+                                        eps = 0.001, decimal.mark = ",")
+kable(tab_coef_arima, digits = 3, format.args = fmt_k)
+```
+
+```{r}
+#| label: tbl-arima
+#| tbl-cap: "ARIMA: ajuste no treino, resíduos e desempenho no teste."
+tab_arima <- data.frame(
+  AICc = sapply(mods_arima, function(m) m$aicc),
+  `LB (p-valor)` = sapply(mods_arima, lb_p),
+  t(sapply(prev_arima, metricas)),
+  check.names = FALSE)
+tab_arima_k <- tab_arima
+tab_arima_k[["LB (p-valor)"]] <- format.pval(tab_arima$`LB (p-valor)`, digits = 2,
+                                             eps = 0.001, decimal.mark = ",")
+kable(tab_arima_k, digits = 3, format.args = fmt_k)
+```
+
+```{r}
+#| label: aux-arima
+i_arima      <- which.min(tab_arima$RMSE)
+melhor_arima <- rownames(tab_arima)[i_arima]
+i_aicc_arima <- which.min(tab_arima$AICc)
+theta_r      <- unname(coef(mods_arima[[1]])["ma1"])
+```
+
+```{r}
+#| label: fig-res-arima
+#| fig-cap: "Resíduos do melhor modelo ARIMA no treino."
+#| fig-height: 4.5
+checkresiduals(mods_arima[[i_arima]], test = FALSE)
+```
+```{r}
+#| label: fig-prev-arima
+#| fig-cap: "Previsões dos modelos ARIMA no teste."
+graf_prev(prev_arima)
+```
+```{r}
+#| label: fig-ic-arima
+#| fig-cap: "Previsão do melhor modelo ARIMA no teste, com intervalos de previsão de 80% e 95%."
+autoplot(prev_arima[[i_arima]], include = 60) +
+  autolayer(teste, series = "real") +
+  labs(x = "tempo (semanas)", y = "unidades vendidas", colour = NULL, title = NULL)
+```
+Inferência. A @tbl-coef-arima mostra os coeficientes de cada candidato e o teste z de significância. Termos acrescentados ao ARIMA(0,1,1) com p-valor acima de 5% não contribuem para o modelo e indicam sobreparametrização.
+
+Seleção. O menor AICc é o de `r rownames(tab_arima)[i_aicc_arima]` (`r fmt(tab_arima$AICc[i_aicc_arima], 1)`), e o menor RMSE no teste é o de `r melhor_arima` (`r fmt(tab_arima$RMSE[i_arima], 1)`). O `auto.arima` selecionou `r as.character(auto_arima)`, o que serve como conferência da identificação feita pela ACF e PACF. O termo sazonal semanal do A5 não traz ganho relevante, em acordo com a ausência de sazonalidade semanal vista na análise exploratória. O melhor modelo ARIMA é `r melhor_arima`.
+
+Relação com a suavização exponencial. O ARIMA(0,1,1) é equivalente à suavização exponencial simples, com $\alpha = 1 - \theta$ . Como o R escreve o termo de média móvel com sinal positivo ($\theta_R = -\theta$), tem-se $\alpha = 1 + \theta_R$. Com $\theta_R$ = `r fmt(theta_r, 3)`, o $\alpha$ implícito é `r fmt(1 + theta_r, 3)`, próximo do $\alpha$ estimado no SES (`r fmt(tab_par["SES", "alpha"], 3)`). Isso explica por que os dois modelos geram previsões muito parecidas.
+
+Previsão. As previsões de um ARIMA com d = 1 e sem constante convergem para um valor fixo, próximo do último nível estimado, e o intervalo de previsão se alarga com o horizonte, porque a variância do erro de previsão cresce a cada passo (@fig-ic-arima).
+
+Limitações e melhorias. Os modelos ARIMA não usam o calendário nem a promoção, e não representam a sazonalidade anual. Possíveis melhorias: ARIMA com regressores (regressão com erros ARIMA), usando `pct_promo` e indicadoras de mês, e uma transformação logarítmica para estabilizar a variância, que é maior no fim da série.
+
 # Conclusões e limitações
 
 ```{r}
@@ -658,10 +756,33 @@ melhor <- function(tab, grupo) {
 }
 tab_final <- rbind(melhor(tab_ref, "Referência"),
                    melhor(tab_reg, "Regressão"),
-                   melhor(tab_ets, "Suavização exponencial"))
+                   melhor(tab_ets, "Suavização exponencial"),
+                   melhor(tab_arima, "ARIMA"))
 kable(tab_final, digits = 2, format.args = fmt_k)
 ```
 
-Entre os grupos de modelos, o melhor modelo de suavização exponencial (`r tab_final$modelo[3]`, RMSE de `r fmt(tab_final$RMSE[3], 1)`) e o naive (RMSE de `r fmt(tab_final$RMSE[1], 1)`) têm desempenho próximo, e a diferença de `r fmt(100 * (1 - tab_final$RMSE[3] / tab_final$RMSE[1]), 0)`% a favor do primeiro é pequena para um teste de `r n_teste` dias. A regressão com tendência linear tem erro cerca de `r fmt(tab_final$RMSE[2] / tab_final$RMSE[1], 0)` vezes maior, porque a série não segue uma tendência determinística constante.
+Comparando o melhor modelo de cada grupo, os modelos que se adaptam ao nível recente da série tiveram desempenho claramente superior aos de tendência global fixa. O Holt (RMSE de [X]) e o melhor ARIMA, [ARIMA(0,1,1)] (RMSE de [Y]), ficaram próximos entre si e próximos do naive (RMSE de [Z]). Já a melhor regressão, [R3], teve erro cerca de [N] vezes maior, porque extrapola uma tendência linear estimada sobre a fase de lançamentos e o pico de 2023, que não se repete no teste. O modelo final escolhido é o Holt, por apresentar o menor RMSE e MAE no teste e resíduos sem autocorrelação significativa (Ljung-Box com p-valor de [P]). A proximidade com o ARIMA(0,1,1) era esperada, já que esse modelo equivale à suavização exponencial simples. A vantagem do Holt, porém, é pequena e foi medida em um único período de teste de 30 dias, relativamente estável.
 
-A análise exploratória indica uma série não estacionária, que se torna estacionária com diferenciação, sem sazonalidade semanal relevante e com ACF/PACF da série diferenciada compatíveis com um componente de média móvel. Modelos que se adaptam ao nível da série (naive e Holt) funcionam melhor que modelos com tendência global fixa, e os modelos sazonais de período 7 não trazem ganho.
+A análise exploratória mostrou uma série não estacionária, que se torna estacionária com uma diferença simples, sem sazonalidade semanal relevante e com ACF e PACF da série diferenciada compatíveis com um componente de média móvel. Os resultados da modelagem confirmam esse diagnóstico:
+
+as indicadoras de dia da semana não melhoraram a regressão;
+os modelos sazonais de período 7 não reduziram o AICc nem o erro de previsão;
+o ARIMA identificado pela ACF e PACF ficou entre os melhores modelos.
+
+# Conclusões: previsão final
+
+```{r}
+#| label: fig-prev-final
+#| fig-cap: "Previsão final para os 30 dias seguintes ao fim da base, com o modelo escolhido reajustado na série completa."
+# TODO: trocar pela especificação do modelo vencedor da tabela final
+modelo_final <- ets(serie_ts, model = "AAN", damped = FALSE)   # exemplo: Holt
+prev_final   <- forecast(modelo_final, h = 30)
+autoplot(prev_final, include = 120) +
+  labs(x = "tempo (semanas)", y = "unidades vendidas", title = NULL)
+```
+
+O modelo escolhido foi reajustado com a série completa (treino e teste) para prever os 30 dias seguintes ao fim da base.
+
+# Conclusões: limitações gerais
+
+(i) Como a base é sintética, os padrões encontrados (tendência, ciclos e efeito de promoção) foram gerados por um simulador, e o bom desempenho de um modelo pode refletir as regras do gerador, e não um comportamento real de demanda. (ii) A série agregada mistura demanda e ciclo de vida do portfólio: o treino inclui o período de lançamentos escalonados de SKUs, que cria um de crescimento que não se repete no teste e prejudica os modelos com tendência global. (iii) As vendas são limitadas pelo estoque: nos dias de ruptura, a venda observada subestima a demanda. (iv) A avaliação usa um único corte de 30 dias, em um trecho estável da série. 
