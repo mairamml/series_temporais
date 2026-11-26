@@ -1,0 +1,812 @@
+---
+title: "Previsão de vendas diárias de bens de consumo (FMCG)"
+subtitle: "Análise exploratória, regressão, suavização exponencial e ARIMA"
+author: "Gabriela Lopes, Gabriel Vilhena, Maíra Amaral e Maria Elisa Moreira"
+lang: pt
+format:
+  pdf:
+    toc: true
+    toc-title: "Sumário"
+    number-sections: true
+    colorlinks: true
+    fig-width: 6.5
+    fig-height: 3.4
+    fig-pos: "H"
+    include-in-header:
+      text: |
+        \RecustomVerbatimEnvironment{Highlighting}{Verbatim}{commandchars=\\\{\},fontsize=\scriptsize}
+  html:
+    toc: true
+    toc-title: "Sumário"
+    number-sections: true
+    embed-resources: true
+    fig-width: 7
+    fig-height: 3.6
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: pacotes
+library(ggplot2)
+library(forecast)
+library(tseries)
+library(patchwork)
+library(knitr)
+
+options(OutDec = ",", knitr.kable.NA = "")
+theme_set(theme_minimal(base_size = 10))
+
+# Parâmetros do trabalho
+ARQUIVO    <- "FMCG_2022_2024.csv"
+M          <- 7      # período semanal (dados diários)
+PROP_TESTE <- 0.2
+MAX_TESTE  <- 30     # limite máximo do enunciado para o teste com dados diários
+LAGS       <- 60
+DIAS_SEM   <- c("seg", "ter", "qua", "qui", "sex", "sáb", "dom")
+MESES      <- c("jan", "fev", "mar", "abr", "mai", "jun",
+                "jul", "ago", "set", "out", "nov", "dez")
+dir.create("dados_p1", showWarnings = FALSE)
+
+fmt <- function(x, d = 2) {
+  formatC(x, format = "f", digits = d, big.mark = ".", decimal.mark = ",")
+}
+fmt_p <- function(p) format.pval(p, digits = 2, eps = 0.001, decimal.mark = ",")
+fmt_k <- list(big.mark = ".", decimal.mark = ",")
+```
+
+# Introdução
+
+Este trabalho analisa e modela a série temporal de unidades vendidas por dia, obtida pela soma das vendas de todos os produtos de uma base de bens de consumo de alto giro (FMCG). O relatório descreve a base, apresenta a análise exploratória dos dados e da série, ajusta modelos de previsão por grupo (referência, regressão, suavização exponencial e ARIMA) e avalia o desempenho preditivo em um conjunto de teste.
+
+A análise é feita sobre o total de unidades vendidas. As categorias de produtos aparecem apenas na descrição da base, e nenhuma categoria específica é modelada separadamente.
+
+# Descrição dos dados
+
+A base `FMCG_2022_2024.csv` é um conjunto de dados que simula vendas diárias de produtos de bens de consumo de alto giro (*fast-moving consumer goods*) entre 2022 e 2024. Cada linha representa um SKU em um dia, em um canal de venda e uma região. A base foi desenhada para estudar sazonalidade, ciclo de vida de produtos, efeitos de promoção, rupturas de estoque e previsão de demanda.
+
+A base foi obtida no Kaggle (*FMCG Daily Sales Data 2022–2024*, de Beata Faron, disponível em <https://www.kaggle.com/datasets/beatafaron/fmcg-daily-sales-data-to-2022-2024>). Segundo a própria autora, trata-se de uma base **sintética**, que simula vendas de um fabricante de bens de consumo na Polônia, inspirada em cenários reais do setor. O uso de uma base sintética foi autorizado pelo professor da disciplina.
+
+| Variável | Descrição |
+|---|---|
+| `date` | data da venda |
+| `sku`, `brand`, `segment`, `category` | identificação do produto |
+| `channel`, `region`, `pack_type` | canal, região e tipo de embalagem |
+| `price_unit` | preço unitário |
+| `promotion_flag` | indicador de promoção (0/1) |
+| `delivery_days` | prazo de entrega, em dias |
+| `stock_available`, `delivered_qty` | estoque disponível e quantidade entregue |
+| `units_sold` | unidades vendidas (variável de interesse) |
+
+# Pré-processamento dos dados
+
+```{r}
+#| label: leitura
+bruto <- read.csv(ARQUIVO, stringsAsFactors = FALSE)
+bruto$date <- as.Date(bruto$date)
+
+n_bruto    <- nrow(bruto)
+n_na       <- sum(is.na(bruto))
+n_dup      <- sum(duplicated(bruto))
+n_neg_vend <- sum(bruto$units_sold < 0)
+n_neg_est  <- sum(bruto$stock_available < 0)
+n_neg_entr <- sum(bruto$delivered_qty < 0)
+```
+
+A base tem `r fmt(n_bruto, 0)` linhas e `r ncol(bruto)` colunas. As verificações de qualidade encontraram:
+
+- valores ausentes: `r n_na`
+- linhas duplicadas: `r n_dup`
+- `units_sold` negativo: `r n_neg_vend` linhas
+- `stock_available` negativo: `r n_neg_est` linhas; `delivered_qty` negativo: `r n_neg_entr` linhas.
+
+Para o tratamento dessa base, removemos as linhas com `units_sold` negativo, já que uma venda negativa não existe. Como são poucas linhas, o efeito sobre o total diário é desprezível. As linhas com estoque ou entrega negativos foram mantidas, pois a série usa apenas `units_sold` e a venda dessas linhas pode ser válida.
+
+```{r}
+#| label: limpeza
+dados <- bruto[bruto$units_sold >= 0, ]
+c(removidas = nrow(bruto) - nrow(dados), restantes = nrow(dados))
+```
+
+# Análise exploratória da base
+
+Nesta seção são usadas todas as linhas e todas as categorias, sem recorte de período. A base cobre `r length(unique(dados$date))` datas consecutivas, de `r format(min(dados$date), "%d/%m/%Y")` a `r format(max(dados$date), "%d/%m/%Y")`, `r length(unique(dados$sku))` SKUs e `r length(unique(dados$category))` categorias. Canais, regiões e tipos de embalagem têm participação semelhante nas linhas.
+
+## Categorias e variáveis numéricas
+
+```{r}
+#| label: tbl-categorias
+#| tbl-cap: "Resumo por categoria."
+tab_cat <- data.frame(
+  SKUs   = tapply(dados$sku, dados$category, function(x) length(unique(x))),
+  linhas = as.vector(table(dados$category)),
+  total  = tapply(dados$units_sold, dados$category, sum),
+  media  = tapply(dados$units_sold, dados$category, mean))
+tab_cat$pct <- 100 * tab_cat$total / sum(tab_cat$total)
+kable(tab_cat, digits = 1, format.args = fmt_k,
+      col.names = c("SKUs", "linhas", "unidades vendidas",
+                    "média por linha", "% do total"))
+```
+
+```{r}
+#| label: tbl-numericas
+#| tbl-cap: "Resumo das variáveis numéricas (nível de linha)."
+vars_num <- c("price_unit", "delivery_days", "stock_available",
+              "delivered_qty", "units_sold")
+tab_num <- t(sapply(dados[vars_num], summary))
+colnames(tab_num) <- c("mín", "q1", "mediana", "média", "q3", "máx")
+kable(tab_num, digits = 1, format.args = fmt_k)
+```
+
+## Promoções e rupturas de estoque
+
+```{r}
+#| label: tbl-promo
+#| tbl-cap: "Venda média por linha, com e sem promoção, por categoria."
+media_promo <- with(dados, tapply(units_sold, list(category, promotion_flag), mean))
+tab_promo <- cbind(media_promo, media_promo[, 2] / media_promo[, 1])
+colnames(tab_promo) <- c("sem promoção", "com promoção", "razão")
+kable(tab_promo, digits = 2, format.args = fmt_k)
+
+sem_estoque <- dados$stock_available == 0
+n_ruptura   <- sum(sem_estoque)
+n_zero      <- sum(dados$units_sold == 0)
+n_zero_rup  <- sum(dados$units_sold == 0 & sem_estoque)
+```
+
+As promoções aparecem em `r fmt(100 * mean(dados$promotion_flag), 1)`% das linhas e aproximadamente dobram a venda média por linha: a razão entre as vendas médias com e sem promoção varia de `r fmt(min(tab_promo[, 3]))` a `r fmt(max(tab_promo[, 3]))` entre as categorias.
+
+Há `r fmt(n_ruptura, 0)` linhas com estoque zerado (`r fmt(100 * mean(sem_estoque), 1)`% da base) e `r fmt(n_zero, 0)` linhas com venda zero, das quais `r fmt(n_zero_rup, 0)` coincidem com estoque zerado. A venda zero decorre, portanto, quase sempre da falta de produto, e não da ausência de demanda. Essas linhas foram mantidas.
+
+## Ciclo de vida dos SKUs
+
+Os SKUs não estão todos presentes desde o início da base: cada um tem uma data de lançamento.
+
+```{r}
+#| label: fig-lancamento
+#| fig-cap: "Data da primeira venda de cada SKU e número de SKUs vendendo por dia."
+#| fig-height: 5.5
+entrada <- aggregate(date ~ sku + category, data = dados, FUN = min)
+names(entrada) <- c("sku", "categoria", "primeira_venda")
+skus_dia <- aggregate(sku ~ date, data = dados, FUN = function(x) length(unique(x)))
+max_skus <- max(skus_dia$sku)
+data_portfolio_completo <- max(skus_dia$date[skus_dia$sku < max_skus]) + 1
+
+p_a <- ggplot(entrada, aes(primeira_venda, reorder(sku, primeira_venda),
+                           colour = categoria)) +
+  geom_point(size = 2) +
+  labs(x = NULL, y = "SKU", colour = NULL) +
+  theme(legend.position = "bottom", axis.text.y = element_text(size = 6))
+p_b <- ggplot(skus_dia, aes(date, sku)) +
+  geom_step(colour = "grey30") +
+  labs(x = NULL, y = "SKUs vendendo por dia")
+p_a / p_b + plot_layout(heights = c(2, 1))
+```
+
+Os `r nrow(entrada)` SKUs são lançados de forma escalonada, entre `r format(min(entrada$primeira_venda), "%d/%m/%Y")` e `r format(max(entrada$primeira_venda), "%d/%m/%Y")`, e nenhum deixa de ser vendido depois. Somente a partir de `r format(data_portfolio_completo, "%d/%m/%Y")` todos os `r max_skus` SKUs vendem em todos os dias. Esse ciclo de vida é uma característica da base e influencia a série agregada.
+
+## Tendência por categoria
+
+```{r}
+#| label: fig-categorias
+#| fig-cap: "Venda média diária por mês, por categoria."
+cat_dia <- aggregate(units_sold ~ date + category, data = dados, FUN = sum)
+cat_dia$mes <- as.Date(format(cat_dia$date, "%Y-%m-01"))
+cat_mes <- aggregate(units_sold ~ mes + category, data = cat_dia, FUN = mean)
+
+ggplot(cat_mes, aes(mes, units_sold, colour = category)) +
+  geom_line(linewidth = 0.8) +
+  labs(x = NULL, y = "unidades por dia (média do mês)", colour = NULL) +
+  theme(legend.position = "bottom")
+```
+
+As categorias começam em momentos diferentes, conforme o lançamento de seus SKUs. Yogurt, que responde por `r fmt(tab_cat["Yogurt", "pct"], 0)`% das unidades, tem ciclos anuais nítidos, com máximos no primeiro semestre e mínimos no fim do ano. Milk e SnackBar têm oscilações menores, e Juice permanece praticamente estável. A análise temporal a seguir usa o total de unidades vendidas, e não uma categoria específica.
+
+# Série temporal de unidades vendidas
+
+## Construção da série de análise a partir da base original
+
+A série de análise é obtida da base original pelas etapas abaixo, todas executadas no código desta seção:
+
+1. Leitura de `FMCG_2022_2024.csv` e remoção das linhas com `units_sold` negativo (seção de pré-processamento).
+2. Agregação diária: soma de `units_sold` por data, considerando todas as categorias, canais, regiões e embalagens. O resultado é a variável `vendas`.
+3. Variáveis auxiliares por dia: `skus_ativos` (SKUs distintos com venda no dia) e `pct_promo` (percentual de linhas do dia com `promotion_flag = 1`).
+4. Variáveis de calendário: `dsem` (dia da semana) e `mes`, derivadas da data.
+5. Verificação do calendário: confirma-se que não há datas faltantes entre o primeiro e o último dia.
+6. Divisão treino/teste: o teste contém `min(30, round(0,2 · n))` dias finais, e o treino contém todos os dias anteriores, em ordem temporal. A coluna `conjunto` registra a divisão.
+7. Exportação para `dados_p1/serie_diaria_total.csv`.
+
+```{r}
+#| label: serie
+vendas      <- tapply(dados$units_sold, dados$date, sum)
+skus_ativos <- tapply(dados$sku, dados$date, function(x) length(unique(x)))
+pct_promo   <- 100 * tapply(dados$promotion_flag, dados$date, mean)
+
+serie <- data.frame(date = as.Date(names(vendas)), vendas = as.numeric(vendas),
+                    skus_ativos = as.numeric(skus_ativos),
+                    pct_promo = as.numeric(pct_promo))
+serie$dsem <- factor(DIAS_SEM[as.integer(format(serie$date, "%u"))], levels = DIAS_SEM)
+serie$mes  <- factor(MESES[as.integer(format(serie$date, "%m"))], levels = MESES)
+
+calendario <- seq(min(serie$date), max(serie$date), by = "day")
+dias_faltantes <- length(setdiff(calendario, serie$date))
+stopifnot(dias_faltantes == 0)
+
+n        <- nrow(serie)
+n_teste  <- min(MAX_TESTE, round(PROP_TESTE * n))
+n_treino <- n - n_teste
+serie$conjunto <- rep(c("treino", "teste"), c(n_treino, n_teste))
+
+write.csv(serie, "dados_p1/serie_diaria_total.csv", row.names = FALSE)
+```
+
+```{r}
+#| label: tbl-dicionario
+#| tbl-cap: "Colunas do arquivo dados_p1/serie_diaria_total.csv."
+kable(data.frame(
+  coluna = c("date", "vendas", "skus_ativos", "pct_promo", "dsem", "mes", "conjunto"),
+  descrição = c("data", "unidades vendidas no dia (todos os produtos)",
+                "número de SKUs com venda no dia",
+                "% de linhas do dia em promoção", "dia da semana", "mês",
+                "treino ou teste")))
+```
+
+Período analisado: `r format(min(serie$date), "%d/%m/%Y")` a `r format(max(serie$date), "%d/%m/%Y")`, isto é, toda a base, com `r n` dias (cerca de `r fmt(n / 365.25, 1)` anos) e `r dias_faltantes` datas faltantes. O período é longo o suficiente para a modelagem e para a avaliação preditiva.
+
+## Divisão em treino e teste
+
+```{r}
+#| label: divisao
+tr <- serie[serie$conjunto == "treino", ]
+te <- serie[serie$conjunto == "teste", ]
+
+serie_ts <- ts(serie$vendas, frequency = M)
+treino <- window(serie_ts, end = time(serie_ts)[n_treino])
+teste  <- window(serie_ts, start = time(serie_ts)[n_treino + 1])
+
+kable(data.frame(
+  conjunto = c("série completa", "treino", "teste"),
+  início = format(c(min(serie$date), min(tr$date), min(te$date)), "%d/%m/%Y"),
+  fim = format(c(max(serie$date), max(tr$date), max(te$date)), "%d/%m/%Y"),
+  dias = c(n, nrow(tr), nrow(te))),
+  caption = "Período de análise e divisão treino/teste.")
+```
+
+O conjunto de teste segue a regra do enunciado: 20% dos registros, limitado a `r MAX_TESTE` dias para dados diários. Como 20% de `r n` dias seriam `r round(PROP_TESTE * n)` dias, o teste fica com `r n_teste` dias e o treino com `r n_treino` dias (`r fmt(100 * n_treino / n, 1)`% da série). A análise exploratória e o ajuste dos modelos usam apenas o treino.
+
+## Visualização e estatísticas descritivas
+
+```{r}
+#| label: fig-serie
+#| fig-cap: "Unidades vendidas por dia (todos os produtos). A linha tracejada marca o início do teste."
+ggplot(serie, aes(date, vendas)) +
+  geom_line(linewidth = 0.4, colour = "grey20") +
+  geom_vline(xintercept = min(te$date), linetype = "dashed") +
+  labs(x = NULL, y = "unidades vendidas")
+```
+
+```{r}
+#| label: fig-mm7
+#| fig-cap: "Média móvel de 7 dias das unidades vendidas. A linha tracejada marca o início do teste."
+serie$mm7 <- as.numeric(stats::filter(serie$vendas, rep(1 / 7, 7), sides = 1))
+
+ggplot(serie, aes(date, mm7)) +
+  geom_line(linewidth = 0.6, colour = "steelblue", na.rm = TRUE) +
+  geom_vline(xintercept = min(te$date), linetype = "dashed") +
+  labs(x = NULL, y = "média móvel de 7 dias (unidades)")
+```
+
+```{r}
+#| label: tbl-desc
+#| tbl-cap: "Estatísticas descritivas das unidades vendidas por dia."
+tab_desc <- sapply(list(completa = serie$vendas, treino = tr$vendas, teste = te$vendas),
+                   function(x) c(summary(x), dp = sd(x), n = length(x)))
+rownames(tab_desc) <- c("mín", "q1", "mediana", "média", "q3", "máx",
+                        "desvio padrão", "n")
+kable(tab_desc, digits = 1, format.args = fmt_k)
+```
+
+```{r}
+#| label: fig-hist-serie
+#| fig-cap: "Distribuição das unidades vendidas por dia (treino)."
+#| fig-height: 2.8
+hist(tr$vendas, breaks = 30, col = "steelblue", border = "white",
+     main = "", xlab = "unidades vendidas por dia", ylab = "frequência")
+```
+
+A série parte de um nível muito baixo (cerca de 196 unidades por dia no primeiro mês), cresce com os lançamentos de SKUs até cerca de 2.200 unidades em meados de 2022 e, depois de uma estagnação, sobe até o máximo de `r fmt(max(serie$vendas), 0)` unidades em meados de 2023. Em seguida cai para cerca de 3.800 no fim de 2023, volta a subir em 2024 (próximo de 5.000) e termina em torno de 3.700. A oscilação diária em torno da média móvel é pequena diante dessas variações de médio prazo, e a série é não estacionária em nível. Os máximos no meio do ano e os mínimos no fim do ano podem sugerir sazonalidade anual, mas ela se mistura ao ciclo de lançamentos e não pode ser estimada com 3 anos de dados.
+
+No conjunto de teste a série fica em um patamar estável (média de `r fmt(mean(te$vendas), 0)` e desvio padrão de `r fmt(sd(te$vendas), 0)` unidades), com dispersão muito menor que a do treino (desvio padrão de `r fmt(sd(tr$vendas), 0)`).
+
+## Dia da semana e decomposição
+
+```{r}
+#| label: fig-dsem
+#| fig-cap: "Unidades vendidas por dia da semana (treino)."
+#| fig-height: 3
+boxplot(vendas ~ dsem, data = tr, col = "lightblue",
+        xlab = NULL, ylab = "unidades vendidas")
+```
+
+```{r}
+#| label: fig-decompose
+#| fig-cap: "Decomposição clássica aditiva do treino (período 7)."
+#| fig-height: 5.5
+dec <- decompose(treino)
+plot(dec)
+```
+
+```{r}
+#| label: fig-indices
+#| fig-cap: "Índices sazonais semanais da decomposição (treino)."
+#| fig-height: 2.8
+primeiro_dia <- as.integer(format(tr$date[1], "%u"))
+rotulos <- DIAS_SEM[((primeiro_dia - 1 + 0:(M - 1)) %% M) + 1]
+barplot(dec$figure, names.arg = rotulos, col = "steelblue",
+        ylab = "índice sazonal (unidades)")
+abline(h = 0)
+```
+
+Os boxplots por dia da semana são praticamente idênticos, pois a variação de nível da série domina qualquer diferença entre os dias. Na decomposição clássica, a tendência é estimada por média móvel centrada e os índices sazonais semanais, pela média da série sem tendência em cada dia da semana. Esses índices variam de `r fmt(min(dec$figure), 1)` a `r fmt(max(dec$figure), 1)` unidades, cerca de `r fmt(100 * diff(range(dec$figure)) / mean(tr$vendas), 1)`% da média diária (`r fmt(mean(tr$vendas), 0)` unidades). A variação da série vem, portanto, da tendência, e não há sazonalidade semanal relevante.
+
+## Autocorrelação e autocorrelação parcial
+
+```{r}
+#| label: fig-acf-nivel
+#| fig-cap: "ACF e PACF do treino, em nível."
+#| fig-height: 4.5
+ggAcf(treino, lag.max = LAGS) / ggPacf(treino, lag.max = LAGS)
+```
+
+```{r}
+#| label: fig-acf-d1
+#| fig-cap: "ACF e PACF da primeira diferença do treino."
+#| fig-height: 4.5
+d1 <- diff(treino)
+ggAcf(d1, lag.max = LAGS) / ggPacf(d1, lag.max = LAGS)
+acf_nivel  <- Acf(treino, lag.max = 28, plot = FALSE)$acf[, 1, 1]
+pacf_nivel <- Pacf(treino, lag.max = 3, plot = FALSE)$acf[, 1, 1]
+acf_d1     <- Acf(d1, lag.max = 7, plot = FALSE)$acf[, 1, 1]
+```
+
+Em nível, a ACF cai muito lentamente (`r fmt(acf_nivel[2], 3)` no lag 1, `r fmt(acf_nivel[8], 3)` no lag 7 e `r fmt(acf_nivel[29], 3)` no lag 28), que é comportamento típico de série com tendência ou raiz unitária, e a PACF é significativa nos primeiros lags (`r fmt(pacf_nivel[1], 2)`, `r fmt(pacf_nivel[2], 2)` e `r fmt(pacf_nivel[3], 2)` nos lags 1 a 3). Na primeira diferença, a ACF tem um pico negativo no lag 1 (`r fmt(acf_d1[2], 2)`) e valores próximos de zero nos demais lags, enquanto a PACF decai lentamente com sinal negativo. Esse padrão é compatível com um componente de média móvel na série diferenciada. Não há picos nos lags múltiplos de 7, o que concorda com a ausência de sazonalidade semanal.
+
+## Testes de estacionariedade
+
+```{r}
+#| label: tbl-testes
+#| tbl-cap: "Testes de estacionariedade no treino (nível de significância de 5%)."
+decisao <- function(p_adf, p_kpss) {
+  if (p_adf >= .05 && p_kpss < .05) "não estacionária"
+  else if (p_adf < .05 && p_kpss >= .05) "estacionária"
+  else "resultados discordantes"
+}
+resumo_testes <- function(x, nome) {
+  adf  <- suppressWarnings(adf.test(x))
+  kpss <- suppressWarnings(kpss.test(x))
+  data.frame(série = nome, ADF = adf$p.value, KPSS = kpss$p.value,
+             conclusão = decisao(adf$p.value, kpss$p.value))
+}
+tab_testes <- rbind(resumo_testes(treino, "nível"),
+                    resumo_testes(d1, "1ª diferença"))
+kable(tab_testes, digits = 3, col.names = c("série", "ADF (p-valor)",
+                                            "KPSS (p-valor)", "conclusão"),
+      format.args = list(decimal.mark = ","))
+```
+
+No ADF, a hipótese nula é a presença de raiz unitária (não estacionariedade). No KPSS, a hipótese nula é a estacionariedade. Como os dois testes partem de hipóteses nulas opostas, seus resultados são analisados em conjunto. Os p-valores são limitados às tabelas dos testes: [0,01; 0,99] no ADF e [0,01; 0,10] no KPSS.
+
+Em nível, o ADF não rejeita a hipótese de raiz unitária (p-valor de `r fmt(tab_testes$ADF[1], 3)`) e o KPSS rejeita a de estacionariedade (p-valor de `r fmt(tab_testes$KPSS[1], 2)`), de modo que os dois testes concordam: a série é não estacionária. Na primeira diferença, o ADF rejeita a raiz unitária e o KPSS não rejeita a estacionariedade, e a série diferenciada é estacionária. Uma diferença simples (d = 1) é, portanto, suficiente. Como não há sazonalidade semanal, não se justifica diferença sazonal.
+
+# Modelagem
+
+Todos os modelos são ajustados no treino e avaliados na previsão dos `r n_teste` dias do teste. O ajuste no treino é avaliado pelo erro quadrático médio (EQM) e pelo diagnóstico dos resíduos (teste de Ljung-Box). O desempenho preditivo no teste é medido por ME (média de real menos previsto), RMSE (raiz do EQM), MAE e MAPE (em %).
+
+```{r}
+#| label: metricas
+metricas <- function(prev) {
+  accuracy(prev, teste)["Test set", c("ME", "RMSE", "MAE", "MAPE")]
+}
+
+lb_p <- function(m) {
+  out <- NULL
+  capture.output(out <- checkresiduals(m, test = "LB", plot = FALSE))
+  out$p.value
+}
+
+graf_prev <- function(lista, titulo = NULL) {
+  df <- data.frame(date = rep(te$date, length(lista) + 1),
+                   valor = c(te$vendas, unlist(lapply(lista, function(p) p$mean))),
+                   modelo = rep(c("real", names(lista)), each = n_teste))
+  ggplot() +
+    geom_line(data = tail(tr, 45), aes(date, vendas), colour = "grey55") +
+    geom_line(data = df, aes(date, valor, colour = modelo,
+                             linewidth = modelo == "real")) +
+    scale_linewidth_manual(values = c(`TRUE` = 1, `FALSE` = 0.6), guide = "none") +
+    labs(x = NULL, y = "unidades vendidas", colour = NULL, title = titulo) +
+    theme(legend.position = "bottom")
+}
+```
+
+## Modelo de referência
+
+O modelo de referência é o naive, que usa o último valor do treino como previsão para todos os dias do teste. Ele corresponde ao ARIMA(0,1,0), o passeio aleatório. Não tem parâmetros a estimar e define o desempenho mínimo a superar.
+
+```{r}
+#| label: referencia
+prev_ref <- list("naive" = naive(treino, h = n_teste))
+tab_ref <- t(sapply(prev_ref, metricas))
+kable(tab_ref, digits = 2, format.args = fmt_k,
+      caption = "Modelo de referência: desempenho no teste.")
+```
+
+```{r}
+#| label: fig-referencia
+#| fig-cap: "Previsão do modelo de referência no teste (últimos 45 dias do treino em cinza)."
+graf_prev(prev_ref)
+```
+
+```{r}
+#| label: fig-res-ref
+#| fig-cap: "Resíduos do naive no treino."
+#| fig-height: 4.5
+checkresiduals(prev_ref[["naive"]], test = FALSE)
+lb_n <- lb_p(prev_ref[["naive"]])
+```
+
+O naive tem RMSE de `r fmt(tab_ref["naive", "RMSE"], 1)` no teste. Os resíduos do naive são a própria série diferenciada. O teste de Ljung-Box, cuja hipótese nula é a ausência de autocorrelação nos resíduos, tem p-valor de `r fmt_p(lb_n)`: `r ifelse(lb_n < 0.05, "o modelo deixa estrutura temporal sem explicar, o que é coerente com o pico no lag 1 da ACF da série diferenciada", "não há evidência de autocorrelação nos resíduos")`.
+
+## Regressão
+
+Os modelos de regressão são ajustados com `tslm`, com construção em degraus, cada modelo acrescentando um componente ao anterior:
+
+1. R1: tendência linear;
+2. R2: R1 mais variáveis indicadoras de dia da semana (efeito semanal);
+3. R3: R2 mais indicadoras de mês (efeito anual);
+4. R4: R3 mais o percentual de linhas em promoção no dia (`pct_promo`).
+
+Para prever os `r n_teste` dias do teste, as variáveis de calendário são conhecidas e o `pct_promo` é tomado com os valores observados no teste, o que supõe que a promoção é planejada com antecedência.
+
+```{r}
+#| label: regressao
+formulas <- list("R1: tendência"        = treino ~ trend,
+                 "R2: + dia da semana" = treino ~ trend + dsem,
+                 "R3: + mês"            = treino ~ trend + dsem + mes,
+                 "R4: + % de promoção" = treino ~ trend + dsem + mes + pct_promo)
+reg  <- lapply(formulas, function(f) tslm(f, data = tr))
+prev_reg <- lapply(reg, forecast, newdata = te[, c("dsem", "mes", "pct_promo")])
+
+tab_reg <- data.frame(
+  `R² ajustado`  = sapply(reg, function(m) summary(m)$adj.r.squared),
+  `EQM (treino)` = sapply(reg, function(m) mean(residuals(m)^2)),
+  `LB (p-valor)` = sapply(reg, lb_p),
+  t(sapply(prev_reg, metricas)),
+  check.names = FALSE)
+tab_reg_k <- tab_reg
+tab_reg_k[["LB (p-valor)"]] <- fmt_p(tab_reg$`LB (p-valor)`)
+kable(tab_reg_k, digits = 3, format.args = fmt_k,
+      caption = "Regressão: ajuste no treino, resíduos e desempenho no teste.")
+```
+
+```{r}
+#| label: fig-res-reg
+#| fig-cap: "Resíduos dos modelos de regressão no treino."
+#| fig-subcap: ["R1: tendência", "R2: + dia da semana", "R3: + mês", "R4: + % de promoção"]
+#| layout-ncol: 1
+#| fig-height: 3.6
+for (m in reg) checkresiduals(m, test = FALSE)
+```
+
+```{r}
+#| label: fig-prev-reg
+#| fig-cap: "Previsões dos modelos de regressão no teste."
+graf_prev(prev_reg)
+```
+
+```{r}
+#| label: tbl-coef-reg
+#| tbl-cap: "Coeficientes do modelo R4 (exceto indicadoras de mês)."
+coefs <- coef(summary(reg[[4]]))
+kable(coefs[!grepl("^mes", rownames(coefs)), ], digits = 3, format.args = fmt_k)
+```
+
+```{r}
+#| label: aux-reg
+i_reg      <- which.min(tab_reg$RMSE)
+melhor_reg <- rownames(tab_reg)[i_reg]
+coef_trend <- coefs["trend", "Estimate"]
+coef_promo <- coefs["pct_promo", "Estimate"]
+p_promo    <- coefs["pct_promo", "Pr(>|t|)"]
+eqm_reg    <- tab_reg[["EQM (treino)"]]
+```
+
+Efeito de cada componente. O dia da semana praticamente não melhora o ajuste: o R² ajustado vai de `r fmt(tab_reg[1, 1], 3)` para `r fmt(tab_reg[2, 1], 3)` e o EQM no treino passa de `r fmt(eqm_reg[1], 0)` para `r fmt(eqm_reg[2], 0)`, o que confirma a ausência de sazonalidade semanal observada na análise exploratória. As indicadoras de mês melhoram bastante o ajuste (R² ajustado de `r fmt(tab_reg[2, 1], 3)` para `r fmt(tab_reg[3, 1], 3)` e EQM no treino de `r fmt(eqm_reg[2], 0)` para `r fmt(eqm_reg[3], 0)`), o que indica um padrão anual. O percentual de promoção tem efeito pequeno (teste t com p-valor de `r fmt_p(p_promo)`): cada ponto percentual a mais de linhas em promoção no dia está associado a cerca de `r fmt(coef_promo, 1)` unidades a mais vendidas.
+
+Resíduos. Em todos os modelos o teste de Ljung-Box rejeita a ausência de autocorrelação (p-valor < 0,001), e os gráficos mostram resíduos com forma de curva suave e ACF elevada em todos os lags. Nenhum modelo captura a dinâmica da série (crescimento, pico e queda), de modo que os erros-padrão e os testes t devem ser lidos apenas como indicativos.
+
+Previsão. Todos os modelos superestimam o teste (ME entre `r fmt(min(tab_reg$ME), 0)` e `r fmt(max(tab_reg$ME), 0)` unidades; MAPE entre `r fmt(min(tab_reg$MAPE), 0)`% e `r fmt(max(tab_reg$MAPE), 0)`%). A tendência linear estimada no treino, que inclui a rampa de lançamentos e o pico de 2023, cresce `r fmt(coef_trend, 1)` unidades por dia e é extrapolada para cima, enquanto a série termina em patamar próximo de 3.700. O melhor modelo de regressão é `r melhor_reg`, com o menor RMSE no teste, mas seu erro é cerca de `r fmt(tab_reg$RMSE[i_reg] / tab_ref["naive", "RMSE"], 0)` vezes o do naive.
+
+Limitações e melhorias. A tendência linear global é a principal limitação, pois a série não tem tendência constante. Melhorias possíveis: tendência polinomial, o número de SKUs ativos como regressor e indicadoras de feriado. Além disso, o modelo com `pct_promo` exige conhecer a promoção futura.
+
+## Suavização exponencial
+
+Os modelos de suavização exponencial são ajustados na ordem de complexidade:
+
+1. SES (suavização exponencial simples), com `ses()`: apenas nível;
+2. Holt, com `holt()`: nível e tendência;
+3. Holt amortecido, com `holt(damped = TRUE)`: tendência amortecida pelo parâmetro $\phi$, variação do método de Holt que evita previsões muito altas ou muito baixas quando a tendência é acentuada;
+4. Holt-Winters aditivo, com `hw()`: nível, tendência e sazonalidade semanal aditiva (s = 7).
+
+```{r}
+#| label: suavizacao
+prev_ets <- list(
+  "SES"                  = ses(treino,  h = n_teste),
+  "Holt"                 = holt(treino, h = n_teste),
+  "Holt amortecido"      = holt(treino, h = n_teste, damped = TRUE),
+  "Holt-Winters aditivo" = hw(treino, seasonal = "additive", h = n_teste))
+ajustes <- lapply(prev_ets, function(p) p$model)
+```
+
+As funções do R estimam os parâmetros em outra parametrização. Para compará-los com a notação vista em aula, eles são convertidos: $\alpha$ é mantido, $\beta = \beta_R/\alpha_R$ e $\gamma = \gamma_R/(1-\alpha_R)$. $\phi$ é o fator de amortecimento, e $\bar Y_0$ e $\hat T_0$ são o nível e a tendência iniciais.
+
+```{r}
+#| label: tbl-param-ets
+#| tbl-cap: "Parâmetros de suavização na notação da aula."
+notacao_aula <- function(m) {
+  p <- m$par
+  get <- function(nome) if (nome %in% names(p)) unname(p[nome]) else NA
+  alpha <- get("alpha")
+  c(alpha = alpha, beta = get("beta") / alpha,
+    gamma = get("gamma") / (1 - alpha), phi = get("phi"),
+    l0 = get("l"), b0 = get("b"))
+}
+tab_par <- t(sapply(ajustes, notacao_aula))
+colnames(tab_par) <- c("alpha", "beta", "gamma", "phi", "nível inicial", "tendência inicial")
+kable(tab_par, digits = 4, format.args = fmt_k)
+```
+
+```{r}
+#| label: tbl-ets
+#| tbl-cap: "Suavização exponencial: ajuste no treino, resíduos e desempenho no teste."
+tab_ets <- data.frame(
+  `EQM (treino)` = sapply(prev_ets, function(p) accuracy(p)["Training set", "RMSE"]^2),
+  `LB (p-valor)` = sapply(ajustes, lb_p),
+  t(sapply(prev_ets, metricas)),
+  check.names = FALSE)
+tab_ets_k <- tab_ets
+tab_ets_k[["LB (p-valor)"]] <- fmt_p(tab_ets$`LB (p-valor)`)
+kable(tab_ets_k, digits = 3, format.args = fmt_k)
+```
+
+```{r}
+#| label: fig-res-ets
+#| fig-cap: "Resíduos dos modelos de suavização exponencial no treino."
+#| fig-subcap: ["SES", "Holt", "Holt amortecido", "Holt-Winters aditivo"]
+#| layout-ncol: 1
+#| fig-height: 3.6
+for (m in ajustes) checkresiduals(m, test = FALSE)
+```
+
+```{r}
+#| label: fig-prev-ets
+#| fig-cap: "Previsões dos modelos de suavização exponencial no teste."
+graf_prev(prev_ets)
+```
+
+```{r}
+#| label: aux-ets
+i_ets       <- which.min(tab_ets$RMSE)
+melhor_ets  <- rownames(tab_ets)[i_ets]
+i_eqm_ets   <- which.min(tab_ets[["EQM (treino)"]])
+ets_lb_ok   <- rownames(tab_ets)[tab_ets[["LB (p-valor)"]] > 0.05]
+ets_lb_nao  <- rownames(tab_ets)[tab_ets[["LB (p-valor)"]] <= 0.05]
+```
+
+Parâmetros. No Holt, $\alpha$ = `r fmt(tab_par["Holt", "alpha"], 2)` e $\beta$ = `r fmt(tab_par["Holt", "beta"], 3)`: o nível reage moderadamente a cada observação e a tendência muda devagar. No Holt-Winters aditivo, $\gamma$ = `r fmt(tab_par["Holt-Winters aditivo", "gamma"], 4)`; um valor próximo de zero indica que os índices sazonais quase não são atualizados, coerente com a sazonalidade semanal desprezível. No Holt amortecido, $\phi$ = `r fmt(tab_par["Holt amortecido", "phi"], 2)`; um valor próximo de 1 indica amortecimento fraco.
+
+Resíduos. `r if (length(ets_lb_ok) > 0) paste0("Para ", paste(ets_lb_ok, collapse = ", "), ", o p-valor do teste de Ljung-Box é maior que 5%, e não há evidência de autocorrelação nos resíduos, ao contrário da regressão.") else "Todos os modelos rejeitam a hipótese de ausência de autocorrelação nos resíduos."` `r if (length(ets_lb_nao) > 0 && length(ets_lb_ok) > 0) paste0("Para ", paste(ets_lb_nao, collapse = ", "), ", o teste rejeita essa hipótese.") else ""`
+
+Seleção. No treino, o menor EQM é o do `r rownames(tab_ets)[i_eqm_ets]` (`r fmt(tab_ets[["EQM (treino)"]][i_eqm_ets], 0)`). No teste, o menor RMSE é o do `r melhor_ets` (`r fmt(tab_ets$RMSE[i_ets], 1)`). O SES e o Holt amortecido têm ME de `r fmt(tab_ets["SES", "ME"], 0)` e `r fmt(tab_ets["Holt amortecido", "ME"], 0)` unidades, respectivamente, contra `r fmt(tab_ets["Holt", "ME"], 0)` do Holt. O melhor modelo de suavização é o `r melhor_ets`. A vantagem sobre os demais é pequena e se apoia em um teste curto e estável.
+
+Limitações e melhorias. A série tem variância maior no fim do período. A sazonalidade anual não pode ser representada com período 7, e um período anual exigiria mais anos de dados.
+
+## ARIMA
+
+Os modelos ARIMA são construídos seguindo o roteiro da metodologia Box-Jenkins: identificação, estimação, diagnóstico e previsão. O processo é iterativo: se o diagnóstico indicar que os resíduos não se comportam como ruído branco, retorna-se à etapa de identificação.
+
+### Identificação
+
+A identificação usa os resultados da análise exploratória. Os testes ADF e KPSS (@tbl-testes) indicaram que a série é não estacionária em nível e estacionária após uma diferença simples, logo d = 1. Na série diferenciada (@fig-acf-d1), a ACF apresenta um único pico significativo, no lag 1, e é próxima de zero nos demais lags, enquanto a PACF decai. Um corte na ACF após o lag q com a PACF decaindo indica um MA(q). Assim, o modelo provisório é o **ARIMA(0,1,1)**:
+
+$$\nabla Y_t = (1 - \theta B)\, a_t .$$
+
+Para verificar se o modelo provisório é suficiente, também são ajustados dois modelos vizinhos, com um parâmetro a mais: ARIMA(0,1,2) e ARIMA(1,1,1).
+
+### Estimação
+
+Os parâmetros são estimados por máxima verossimilhança com a função `Arima()`. Para amostras grandes, os estimadores têm distribuição aproximadamente normal, o que permite testar a significância de cada coeficiente pela estatística $z = \hat\eta / \text{ep}(\hat\eta)$. A variância dos choques, $\sigma^2_a$, também é estimada.
+
+```{r}
+#| label: arima-estimacao
+mods_arima <- list(
+  "A1: ARIMA(0,1,1)" = Arima(treino, order = c(0, 1, 1)),
+  "A2: ARIMA(0,1,2)" = Arima(treino, order = c(0, 1, 2)),
+  "A3: ARIMA(1,1,1)" = Arima(treino, order = c(1, 1, 1)))
+```
+
+```{r}
+#| label: tbl-coef-arima
+#| tbl-cap: "ARIMA: coeficientes estimados e teste z (H0: coeficiente igual a zero)."
+p_coef <- function(m, nome) {
+  z <- coef(m)[nome] / sqrt(diag(m$var.coef))[nome]
+  unname(2 * pnorm(-abs(z)))
+}
+tab_coef_arima <- do.call(rbind, lapply(names(mods_arima), function(nm) {
+  m   <- mods_arima[[nm]]
+  est <- coef(m)
+  if (length(est) == 0) return(NULL)
+  ep  <- sqrt(diag(m$var.coef))
+  z   <- est / ep
+  data.frame(modelo = nm, parâmetro = names(est), estimativa = est,
+             `erro-padrão` = ep, z = z, `p-valor` = 2 * pnorm(-abs(z)),
+             check.names = FALSE, row.names = NULL)
+}))
+tab_coef_arima$`p-valor` <- fmt_p(tab_coef_arima$`p-valor`)
+kable(tab_coef_arima, digits = 3, format.args = fmt_k)
+
+theta_r  <- unname(coef(mods_arima[[1]])["ma1"])
+p_theta  <- p_coef(mods_arima[[1]], "ma1")
+p_ma2_A2 <- p_coef(mods_arima[[2]], "ma2")
+p_ar1_A3 <- p_coef(mods_arima[[3]], "ar1")
+extra_ns <- p_ma2_A2 > 0.05 && p_ar1_A3 > 0.05
+```
+
+O R escreve o termo de média móvel com sinal positivo. Na notação da aula, $\hat\theta = -\hat\theta_R$ = `r fmt(-theta_r, 3)`, com p-valor de `r fmt_p(p_theta)` no teste z. Nos modelos vizinhos, o termo de média móvel acrescentado no A2 tem p-valor de `r fmt_p(p_ma2_A2)` e o termo autorregressivo acrescentado no A3 tem p-valor de `r fmt_p(p_ar1_A3)`. `r if (extra_ns) "Como nenhum dos termos acrescentados é significativo a 5%, o ARIMA(0,1,1) é suficiente, e os modelos maiores estão sobreparametrizados." else "Pelo menos um dos termos acrescentados é significativo a 5%, o que indica que o ARIMA(0,1,1) pode não ser suficiente; essa indicação é avaliada no diagnóstico."`
+
+### Diagnóstico
+
+Os resíduos de cada modelo são avaliados pela ACF e pelo teste de Ljung-Box, cuja hipótese nula é a de que as autocorrelações até o lag h são nulas (resíduos são ruído branco). Os graus de liberdade são descontados do número de parâmetros estimados. Como a estimação e os intervalos de previsão supõem choques gaussianos, a normalidade dos resíduos é verificada pelo teste de Shapiro-Wilk.
+
+```{r}
+#| label: arima-diagnostico
+lb_arima <- sapply(mods_arima, lb_p)
+sw_arima <- sapply(mods_arima, function(m) shapiro.test(residuals(m))$p.value)
+```
+
+```{r}
+#| label: fig-res-arima
+#| fig-cap: "Resíduos dos modelos ARIMA no treino."
+#| fig-subcap: ["A1: ARIMA(0,1,1)", "A2: ARIMA(0,1,2)", "A3: ARIMA(1,1,1)"]
+#| layout-ncol: 1
+#| fig-height: 3.6
+for (m in mods_arima) checkresiduals(m, test = FALSE)
+```
+
+Para o ARIMA(0,1,1), o teste de Ljung-Box `r ifelse(lb_arima[1] > 0.05, "não rejeita", "rejeita")` a hipótese de ruído branco (p-valor de `r fmt_p(lb_arima[1])`). `r if (lb_arima[1] > 0.05) "O modelo provisório é, portanto, aceito e segue para a etapa de previsão, sem necessidade de retornar à identificação." else "Seguindo o roteiro, retorna-se à identificação: os modelos vizinhos A2 e A3 são as alternativas avaliadas, e a escolha considera também o diagnóstico de seus resíduos (Tabela de previsão a seguir)."` Quanto à normalidade, o teste de Shapiro-Wilk `r ifelse(sw_arima[1] > 0.05, "não rejeita", "rejeita")` a hipótese nula (p-valor de `r fmt_p(sw_arima[1])`)`r ifelse(sw_arima[1] > 0.05, ".", ", de modo que os intervalos de previsão devem ser lidos como aproximados.")`
+
+### Previsão
+
+```{r}
+#| label: tbl-arima
+#| tbl-cap: "ARIMA: estimação, diagnóstico e desempenho no teste."
+prev_arima <- lapply(mods_arima, forecast, h = n_teste, level = 95)
+tab_arima <- data.frame(
+  `sigma2 estimado`   = sapply(mods_arima, function(m) m$sigma2),
+  `LB (p-valor)`      = lb_arima,
+  `Shapiro (p-valor)` = sw_arima,
+  t(sapply(prev_arima, metricas)),
+  check.names = FALSE)
+tab_arima_k <- tab_arima
+for (col in c("LB (p-valor)", "Shapiro (p-valor)")) {
+  tab_arima_k[[col]] <- fmt_p(tab_arima[[col]])
+}
+kable(tab_arima_k, digits = 3, format.args = fmt_k)
+
+i_arima      <- which.min(tab_arima$RMSE)
+melhor_arima <- rownames(tab_arima)[i_arima]
+```
+
+A previsão pontual é a esperança condicional $\hat Y_t(h) = E[Y_{t+h} \mid Y_t, Y_{t-1}, \dots]$, que minimiza o erro quadrático médio de previsão. Para o ARIMA(0,1,1), os pesos da forma de choques são $\psi_i = 1 - \theta$ para $i \geq 1$. Logo, a previsão é constante em h e a variância do erro de previsão cresce linearmente com o horizonte:
+
+$$V(h) = \left[1 + (h-1)(1-\theta)^2\right]\sigma^2_a ,$$
+
+e o intervalo de 95% é $\hat Y_t(h) \pm 1{,}96\sqrt{V(h)}$.
+
+```{r}
+#| label: tbl-ic-arima
+#| tbl-cap: "Previsões pontuais e intervalos de 95% do melhor modelo ARIMA nos primeiros dias do teste."
+p_best <- prev_arima[[i_arima]]
+kable(data.frame(h = 1:5,
+                 previsão = as.numeric(p_best$mean[1:5]),
+                 `limite inferior` = as.numeric(p_best$lower[1:5, 1]),
+                 `limite superior` = as.numeric(p_best$upper[1:5, 1]),
+                 real = te$vendas[1:5], check.names = FALSE),
+      digits = 0, format.args = fmt_k)
+cobertura <- mean(te$vendas >= as.numeric(p_best$lower[, 1]) &
+                  te$vendas <= as.numeric(p_best$upper[, 1]))
+```
+
+```{r}
+#| label: fig-ic-arima
+#| fig-cap: "Previsão do melhor modelo ARIMA no teste, com intervalo de previsão de 95%."
+autoplot(p_best, include = 60) +
+  autolayer(teste, series = "real") +
+  labs(x = "tempo (semanas)", y = "unidades vendidas", colour = NULL, title = NULL)
+```
+
+O melhor modelo ARIMA é o `r melhor_arima`, com RMSE de `r fmt(tab_arima$RMSE[i_arima], 1)` no teste. `r fmt(100 * cobertura, 0)`% dos dias do teste ficaram dentro do intervalo de previsão de 95%.
+
+Limitações e melhorias. Os modelos ARIMA ajustados usam apenas o passado da própria série: não incorporam o dia da semana, os meses nem as promoções, e não representam o padrão anual. Uma melhoria possível é incluir variáveis exógenas, como a promoção, no modelo (ARIMAX).
+
+# Conclusões e limitações
+
+```{r}
+#| label: tbl-final
+#| tbl-cap: "Melhor modelo de cada grupo (critério: RMSE no teste)."
+melhor <- function(tab, grupo) {
+  tab <- as.data.frame(tab)
+  i <- which.min(tab$RMSE)
+  data.frame(grupo = grupo, modelo = rownames(tab)[i],
+             tab[i, c("ME", "RMSE", "MAE", "MAPE")], row.names = NULL)
+}
+tab_final <- rbind(melhor(tab_ref, "Referência"),
+                   melhor(tab_reg, "Regressão"),
+                   melhor(tab_ets, "Suavização exponencial"),
+                   melhor(tab_arima, "ARIMA"))
+kable(tab_final, digits = 2, format.args = fmt_k)
+
+# modelo final: menor RMSE entre os grupos ajustados (exclui a referência)
+i_fin       <- 1 + which.min(tab_final$RMSE[-1])
+nome_final  <- tab_final$modelo[i_fin]
+grupo_final <- tab_final$grupo[i_fin]
+lb_todos <- c(setNames(tab_reg[["LB (p-valor)"]],   rownames(tab_reg)),
+              setNames(tab_ets[["LB (p-valor)"]],   rownames(tab_ets)),
+              setNames(tab_arima[["LB (p-valor)"]], rownames(tab_arima)))
+lb_final <- unname(lb_todos[nome_final])
+```
+
+Comparando o melhor modelo de cada grupo (@tbl-final), os modelos que se adaptam ao nível recente da série tiveram desempenho claramente superior aos de tendência global fixa. O melhor modelo de suavização (`r tab_final$modelo[3]`, RMSE de `r fmt(tab_final$RMSE[3], 1)`) e o melhor ARIMA (`r tab_final$modelo[4]`, RMSE de `r fmt(tab_final$RMSE[4], 1)`) ficaram próximos entre si e próximos do naive (RMSE de `r fmt(tab_final$RMSE[1], 1)`). Já a melhor regressão (`r tab_final$modelo[2]`) teve erro cerca de `r fmt(tab_final$RMSE[2] / tab_final$RMSE[1], 0)` vezes o do naive, porque extrapola uma tendência linear estimada sobre a fase de lançamentos e o pico de 2023, que não se repete no teste.
+
+O modelo final escolhido é o **`r nome_final`** (grupo: `r tolower(grupo_final)`), por apresentar o menor RMSE no teste entre os modelos ajustados e resíduos `r ifelse(lb_final > 0.05, "sem autocorrelação significativa", "que ainda apresentam alguma autocorrelação")` (Ljung-Box com p-valor de `r fmt_p(lb_final)`). `r if (tab_final$RMSE[1] <= tab_final$RMSE[i_fin]) "Nenhum modelo, porém, superou o naive no teste, o que indica que, nesse trecho estável da série, o último valor observado já é um bom previsor." else "A vantagem sobre o naive, porém, é pequena e foi medida em um único período de teste de 30 dias, relativamente estável."`
+
+A análise exploratória mostrou uma série não estacionária, que se torna estacionária com uma diferença simples, sem sazonalidade semanal relevante e com ACF e PACF da série diferenciada compatíveis com um componente de média móvel. Os resultados da modelagem confirmam esse diagnóstico:
+
+- as indicadoras de dia da semana praticamente não melhoraram a regressão;
+- o Holt-Winters, com sazonalidade de período 7, não trouxe ganho em relação aos modelos sem sazonalidade;
+- o ARIMA(0,1,1), identificado pela ACF e PACF, ficou entre os melhores modelos.
+
+## Previsão final
+
+```{r}
+#| label: fig-prev-final
+#| fig-cap: "Previsão final para os 30 dias seguintes ao fim da base, com o modelo escolhido reajustado na série completa (intervalo de 95%)."
+h_final <- 30
+if (grupo_final == "Suavização exponencial") {
+  prev_final <- switch(nome_final,
+    "SES"                  = ses(serie_ts,  h = h_final, level = 95),
+    "Holt"                 = holt(serie_ts, h = h_final, level = 95),
+    "Holt amortecido"      = holt(serie_ts, h = h_final, level = 95, damped = TRUE),
+    "Holt-Winters aditivo" = hw(serie_ts, seasonal = "additive", h = h_final, level = 95))
+} else if (grupo_final == "ARIMA") {
+  ordem      <- arimaorder(mods_arima[[nome_final]])[1:3]
+  prev_final <- forecast(Arima(serie_ts, order = ordem), h = h_final, level = 95)
+} else {
+  # a regressão exigiria valores futuros de pct_promo; usa-se o melhor ARIMA
+  ordem      <- arimaorder(mods_arima[[melhor_arima]])[1:3]
+  prev_final <- forecast(Arima(serie_ts, order = ordem), h = h_final, level = 95)
+}
+autoplot(prev_final, include = 120) +
+  labs(x = "tempo (semanas)", y = "unidades vendidas", title = NULL)
+```
+
+O modelo escolhido foi reajustado com a série completa (treino e teste) para prever os 30 dias seguintes ao fim da base. A previsão vai de `r fmt(prev_final$mean[1], 0)` unidades no primeiro dia a `r fmt(prev_final$mean[h_final], 0)` no trigésimo, e o intervalo de 95% se alarga com o horizonte, como esperado.
+
+## Limitações
+
+(i) Como a base é sintética, os padrões encontrados (tendência, ciclos e efeito de promoção) foram gerados por um simulador, e o bom desempenho de um modelo pode refletir as regras do gerador, e não um comportamento real de demanda. (ii) A série agregada mistura demanda e ciclo de vida do portfólio: o treino inclui o período de lançamentos escalonados de SKUs, que cria uma rampa de crescimento que não se repete no teste e prejudica os modelos com tendência global. (iii) As vendas são limitadas pelo estoque: nos dias de ruptura, a venda observada subestima a demanda. (iv) A avaliação usa um único corte de 30 dias, em um trecho estável da série.
+
+## Possíveis melhorias
+
+Restringir a análise ao período após a entrada de todos os SKUs; usar tendência polinomial na regressão; incluir indicadoras de feriado; e incluir variáveis exógenas, como a promoção, no ARIMA (ARIMAX).
